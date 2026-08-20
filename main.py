@@ -1,112 +1,150 @@
-import sys
 import os
-import subprocess
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit,
-    QPushButton, QFileDialog, QMessageBox, QComboBox
-)
-from PySide6.QtGui import QIcon
-from PySide6.QtCore import QSize, Qt
+import yt_dlp
 
-from pytubefix import YouTube
 
-class YouTubeAudioDownloader(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("YouTube Audio Downloader")
-        self.setFixedSize(400, 250)
-        self.init_ui()
+class YtMp3Downloader:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("YouTube → MP3 Downloader")
+        self.root.geometry("640x560")
+        self.root.minsize(520, 460)
+        self._build_ui()
 
-        # Ganti dengan path ffmpeg kamu jika belum masuk PATH
-        self.ffmpeg_path = "C:/FFMPEG/bin/ffmpeg.exe"  # atau contoh: "C:\FFMPEG\bin\ffmpeg.exe"
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        # --- URL input (supports multiple URLs, one per line)
+        url_frame = ttk.LabelFrame(self.root, text="URL(s) — one per line")
+        url_frame.pack(fill="both", padx=10, pady=5)
+        self.url_box = scrolledtext.ScrolledText(url_frame, height=6, wrap=tk.WORD)
+        self.url_box.pack(fill="both", expand=True, padx=5, pady=5)
 
-    def init_ui(self):
-        layout = QVBoxLayout()
+        # --- Save folder selection
+        folder_frame = ttk.LabelFrame(self.root, text="Save folder")
+        folder_frame.pack(fill="x", padx=10, pady=5)
+        self.folder_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
+        ttk.Entry(folder_frame, textvariable=self.folder_var).pack(
+            side="left", fill="x", expand=True, padx=5, pady=5)
+        ttk.Button(folder_frame, text="Browse…", command=self._browse_folder).pack(
+            side="left", padx=(0, 5), pady=5)
 
-        layout.addWidget(QLabel("YouTube URL:"))
-        self.url_entry = QLineEdit()
-        self.url_entry.setPlaceholderText("Paste the YouTube URL here...")
-        layout.addWidget(self.url_entry)
+        # --- Options
+        opt_frame = ttk.LabelFrame(self.root, text="Options")
+        opt_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Label(opt_frame, text="MP3 quality (kbps):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.quality_var = tk.StringVar(value="192")
+        ttk.Combobox(opt_frame, textvariable=self.quality_var,
+                     values=["128", "192", "256", "320"], width=5,
+                     state="readonly").grid(row=0, column=1, padx=(0, 15), sticky="w")
+        self.playlist_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_frame, text="Download full playlist",
+                        variable=self.playlist_var).grid(row=0, column=2, padx=5, sticky="w")
 
-        layout.addWidget(QLabel("Choose Audio Format:"))
-        self.format_box = QComboBox()
-        self.format_box.addItems(["MP3", "AAC", "WAV", "AIF", "Apple Lossless (ALAC)"])
-        layout.addWidget(self.format_box)
+        # --- Progress bar
+        prog_frame = ttk.LabelFrame(self.root, text="Progress")
+        prog_frame.pack(fill="x", padx=10, pady=5)
+        self.progress = tk.DoubleVar()
+        ttk.Progressbar(prog_frame, variable=self.progress, maximum=100).pack(
+            fill="x", padx=5, pady=(5, 0))
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(prog_frame, textvariable=self.status_var).pack(anchor="w", padx=5, pady=5)
 
-        download_button = QPushButton()
-        download_button.setIcon(QIcon("D:/Code/Python/PySide/mp3 downloader youtube/download (4).png"))
-        download_button.setIconSize(QSize(32, 32))
-        download_button.setFixedSize(50, 50)
-        download_button.setToolTip("Download & Convert")
-        download_button.clicked.connect(self.download_and_convert)
-        layout.addWidget(download_button, alignment=Qt.AlignCenter)
+        # --- Download button
+        self.download_btn = ttk.Button(self.root, text="Download & Convert to MP3",
+                                       command=self._start_download)
+        self.download_btn.pack(pady=8)
 
-        self.setLayout(layout)
+        # --- Log window
+        log_frame = ttk.LabelFrame(self.root, text="Log")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        self.log_box = scrolledtext.ScrolledText(log_frame, height=7, state="disabled", wrap=tk.WORD)
+        self.log_box.pack(fill="both", expand=True, padx=5, pady=5)
 
-    def download_and_convert(self):
-        url = self.url_entry.text().strip()
-        format_choice = self.format_box.currentText()
+    # ------------------------------------------------------------- helpers
+    def _browse_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.folder_var.get() or ".")
+        if folder:
+            self.folder_var.set(folder)
 
-        extensions = {
-            "MP3": (".mp3", {"acodec": "libmp3lame"}),
-            "AAC": (".aac", {"acodec": "aac"}),
-            "WAV": (".wav", {"acodec": "pcm_s16le"}),
-            "AIF": (".aif", {"acodec": "pcm_s16be"}),
-            "Apple Lossless (ALAC)": (".m4a", {"acodec": "alac"})
-        }
+    def _log(self, msg):
+        # root.after() makes this safe to call from the download thread
+        def job():
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", msg + "\n")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        self.root.after(0, job)
 
-        if not url:
-            QMessageBox.warning(self, "Warning", "Please enter a YouTube URL.")
+    def _set_progress(self, pct, status):
+        def job():
+            self.progress.set(pct)
+            self.status_var.set(status)
+        self.root.after(0, job)
+
+    # -------------------------------------------------------- yt-dlp hook
+    def _hook(self, d):
+        if d["status"] == "downloading":
+            try:
+                pct = float(d.get("_percent_str", "0").strip().rstrip("%"))
+            except ValueError:
+                pct = 0.0
+            status = (f"Downloading… {d.get('_percent_str', '').strip()}   "
+                      f"Speed: {d.get('_speed_str', 'n/a').strip()}   "
+                      f"ETA: {d.get('_eta_str', 'n/a').strip()}")
+            self._set_progress(pct, status)
+        elif d["status"] == "finished":
+            self._set_progress(100, "Converting to MP3… (ffmpeg)")
+            self._log("Download finished → converting with ffmpeg…")
+
+    # ------------------------------------------------------------- actions
+    def _start_download(self):
+        urls = [u.strip() for u in self.url_box.get("1.0", "end").splitlines() if u.strip()]
+        if not urls:
+            messagebox.showwarning("No URL", "Please paste at least one URL.")
             return
 
+        folder = self.folder_var.get().strip()
+        if not os.path.isdir(folder):
+            messagebox.showwarning("Invalid folder", "Please choose a valid save folder.")
+            return
+
+        self.download_btn.configure(state="disabled")
+        # Run download in a background thread so the GUI doesn't freeze
+        threading.Thread(target=self._download, args=(urls, folder), daemon=True).start()
+
+    def _download(self, urls, folder):
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(folder, "%(title)s.%(ext)s"),
+            "noplaylist": not self.playlist_var.get(),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": self.quality_var.get(),
+            }],
+            "progress_hooks": [self._hook],
+            "quiet": True,
+            "ffmpeg_location": r"C:\ffmpeg-n9.0-latest-win64-lgpl-9.0\ffmpeg-n9.0-latest-win64-lgpl-9.0\bin",
+        }
+
         try:
-            yt = YouTube(url)
-            stream = yt.streams.filter(only_audio=True).first()
-
-            if not stream:
-                raise Exception("No audio stream found.")
-
-            download_folder = QFileDialog.getExistingDirectory(self, "Select Download Folder")
-            if not download_folder:
-                return
-
-            QMessageBox.information(self, "Downloading", "Downloading audio...")
-            out_file = stream.download(output_path=download_folder)
-            base = os.path.splitext(out_file)[0]
-
-            ext, codec_opts = extensions.get(format_choice, (".mp3", {"acodec": "libmp3lame"}))
-            final_file = base + ext
-
-            QMessageBox.information(self, "Converting", f"Converting to {format_choice}...")
-
-            # Build ffmpeg command
-            input_args = ['-i', out_file]
-            codec_args = []
-            for k, v in codec_opts.items():
-                codec_args.extend([f'-{k}', v])
-            ffmpeg_command = [self.ffmpeg_path, *input_args, *codec_args, final_file]
-
-            # Run ffmpeg
-            result = subprocess.run(
-                ffmpeg_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            if result.returncode != 0:
-                raise Exception(f"FFmpeg error:\n{result.stderr.strip()}")
-
-            os.remove(out_file)
-            QMessageBox.information(self, "Success", f"Saved as:\n{final_file}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download(urls)
+            self._set_progress(100, "Done ✔")
+            self._log("All downloads finished.")
+            self.root.after(0, lambda: messagebox.showinfo("Done", "All files converted to MP3!"))
+        except Exception as exc:
+            self._log(f"ERROR: {exc}")
+            self._set_progress(0, "Error — see log")
+            self.root.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
+        finally:
+            self.root.after(0, lambda: self.download_btn.configure(state="normal"))
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = YouTubeAudioDownloader()
-    window.show()
-    sys.exit(app.exec())
+    root = tk.Tk()
+    YtMp3Downloader(root)
+    root.mainloop()
